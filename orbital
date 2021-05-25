@@ -1,0 +1,699 @@
+#!/usr/bin/env python3
+# Copyright (c) 2021, Cisco Systems, Inc. and/or its affiliates
+# Licensed under the MIT License, see the "LICENSE" file accompanying this file.
+
+import argparse
+import os
+import re
+import sys
+import time
+import urllib3
+
+from orbital_api import Client, Postback
+
+Env = {}
+
+
+def LoadEnv():
+    Env['debug'] = os.environ.get('ORBAPI_DEBUG', '')
+    Env['key'] = os.environ.get('ORBAPI_KEY', '')
+    Env['token'] = os.environ.get('ORBAPI_TOKEN', '')
+    Env['url'] = os.environ.get('ORBAPI_URL', 'https://localhost:1957')
+    Env['insecure'] = os.environ.get('ORBAPI_INSECURE', '')
+
+
+usage_str = '''orbapi <command> [options]
+
+A command-line integrations API client for Orbital.
+
+Set ORBAPI_KEY and ORBAPI_URL appropriate for your Orbital deployment.
+
+COMMANDS
+    login     Authenticate and obtain a session token. (automatic with other commands)
+    ok        Check that the service is up and client is authenticated.
+    probe     Execute a probe.
+    query     Disable, execute, or schedule a custom query.
+    results   Fetch results and/or status from a query.
+    status    Lookup query status.
+    stock     Return the list of supported stock queries.
+    webhook   Create or check on a configured webhook.
+        create      Create a new webhook.
+        update      Update an existing webhook.
+        get         Look up a single webhook.
+        list        Look up all webhooks in the organization.
+        sendresult  Send an existing result to an existing webhook.
+    features  Check to see what organization features are active.
+        get
+        list
+
+ENVIRONMENT
+    ORBAPI_DEBUG
+        If not an empty string, enables debug mode in the client.
+    ORBAPI_URL
+        URL that points at the API endpoint.
+    ORBAPI_INSECURE
+        If not an empty string, enabled insecure connections to the ORBAPI_URL.
+    ORBAPI_KEY
+        This must be set to your orbital API key, in client_id:secret format; token or key required to authenticate.
+    ORBAPI_TOKEN
+        If set, provides the JWT token for the API session; token or key required to authenticate.
+
+OBTAINING A ORBAPI_KEY
+  1. Log in to Cisco Orbital.
+  2. In Settings, click 'Add API Credentials' to obtain a client id and secret.
+  3. Set ORBAPI_KEY=<client_id>:<client_secret> in your environment.
+  4. Re-run this command
+'''
+
+
+class OrbAPI(object):
+    '''
+    CLI for accessing Orbital.
+    '''
+
+    def __init__(self):
+        self.parser = argparse.ArgumentParser(
+            description='Orbital API Client', usage=usage_str)
+        self.parser.add_argument('command', help='Orbapi command to run')
+        args = self.parser.parse_args(sys.argv[1:2])
+
+        commands = {
+            'login':   (self.do_login, {}),
+            'ok':      (self.do_ok, {}),
+            'probe':   (self.do_probe, {}),
+            'query':   (self.do_query, {
+                'create':  self.do_query_create,
+                'disable': self.do_query_disable},
+            ),
+            'results': (self.do_results, {}),
+            'stock':   (self.do_stock, {}),
+            'webhook': (self.do_webhook, {
+                'create': self.do_webhook_create,
+                'update': self.do_webhook_update,
+                'get':    self.do_webhook_get,
+                'list':   self.do_webhook_list,
+                'sendresult': self.do_webhook_sendresult},
+            ),
+            'features': (self.do_features, {
+                'get':    self.do_features_get,
+                'list':   self.do_features_list},
+            ),
+        }
+        command, subcommands = commands.get(
+            args.command, (self.do_usage, sys.argv[1]))
+        command(subcommands)
+
+    def do_usage(self, command=''):
+        print('Unknown command: %s' % command)
+        self.parser.print_help()
+        exit(1)
+
+    def get_token(self):
+        # Check for a saved token.
+        token = Env['token']
+        if token != '':
+            return token
+
+        # Check for a saved client id and secret.
+        apikey = Env['key']
+        if apikey == '':
+            print('Cannot find ORBAPI_TOKEN or ORBAPI_KEY needed to authenticate.')
+            exit(1)
+
+        key = apikey.split(':')
+        if len(key) != 2:
+            print('Malformed ORBAPI_KEY. Must be in id:secret form.')
+            exit(1)
+
+        try:
+            c = Client(Env['url'], Env['insecure'] != '', '', Env['debug'] != '')
+            r = c.login(apikey)
+
+            token = r.get('token', '')
+            if token == '':
+                print('failed to obtain access token: %s' % r)
+                exit(1)
+
+            Env['token'] = token
+            return token
+        except Exception as ex:
+            print('failed to contact auth server: %s' % ex)
+            exit(1)
+
+    def get_client(self):
+        token = self.get_token()
+        return Client(Env['url'], Env['insecure'] != '', token, Env['debug'] != '')
+
+    def do_login(self, dummy):
+        token = self.get_token()
+        print('Access token:\n%s\n' % token)
+
+    def do_ok(self, dummy):
+        c = self.get_client()
+
+        try:
+            r = c.ok()
+            login = r.get('login', '')
+            if login != '':
+                print('User ID:      %s\nUser Name:    %s\nOrganization: %s\n' % (login.get(
+                    'user', 'n/a'), login.get('userName', 'n/a'), login.get('organization', 'n/a')))
+            else:
+                print('failed to obtain login information: %s' % r)
+
+        except Exception as ex:
+            print('failed to contact orbital service: %s' % ex)
+            exit(1)
+
+    def do_stock(self, dummy):
+        c = self.get_client()
+
+        try:
+            stock = c.stock()
+            if stock.get('queries', '') == '':
+                print('stock call failed: %s' % stock)
+            else:
+                for q in stock['queries']:
+                    # TODO format
+                    lines = '%s\t\t%s\t\t%s\n' % (
+                        q['id'], q['title'], ', '.join(q['os']))
+                    print(lines)
+
+        except Exception as ex:
+            print('failed to contact orbital service: %s' % ex)
+            exit(1)
+
+    def do_webhook(self, subcommands):
+        self.parser = argparse.ArgumentParser(
+            description='Create, update, get, list, or send results to webhooks',
+            usage='''
+            orbapi webhook <subcommand>
+              create
+              update
+              get
+              list
+              sendresult
+            ''')
+        self.parser.add_argument(
+            'subcommand', help='webhook subcommand to run')
+        args = self.parser.parse_args(sys.argv[2:3])
+        subcommands.get(args.subcommand, self.do_usage)()
+
+    def do_webhook_create(self):
+        self.parser = argparse.ArgumentParser(
+            description='Create a webhook')
+        self.parser.add_argument(
+            '--insecure', help='disable insecure request warnings in URLLib')
+        self.parser.add_argument(
+            'url', help='webhook url including protocol')
+        self.parser.add_argument(
+            '--token', help='bearer token to provide on the webhook call; splunk token for splunk format')
+        self.parser.add_argument(
+            '--label', help='label to associate with this webhook')
+        self.parser.add_argument(
+            '--fingerprint', help='fingerprint of destination certificate')
+        self.parser.add_argument(
+            '--disabled', help='the initial disabled state of the webhook', action='store_true', default=False)
+        self.parser.add_argument(
+            '--format', help='optional format of the webhook payload: ctim, splunk, s3')
+        self.parser.add_argument(
+            '--bucket', help='bucket for the s3 format')
+        self.parser.add_argument(
+            '--region', help='region for the s3 format')
+        self.parser.add_argument(
+            '--accesskey', help='accesskey for the s3 format')
+        self.parser.add_argument(
+            '--secretkey', help='secretkey for the s3 format')
+        args = self.parser.parse_args(sys.argv[3:])
+
+        if args.insecure:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        c = self.get_client()
+
+        try:
+            r = c.webhook_create(args.disabled, args.url,
+                                 args.token or '', args.fingerprint or '', args.label or '',
+                                 args.format or '', args.bucket or '', args.region or '',
+                                 args.accesskey or '', args.secretkey or '')
+            if r.get('id', '') != '':
+                print('webhook: %s' % r)
+            else:
+                print('webhook creation failed: %s' % r)
+
+        except Exception as ex:
+            print('failed to contact service: %s' % ex)
+
+    def do_webhook_update(self):
+        self.parser = argparse.ArgumentParser(
+            description='Create a webhook')
+        self.parser.add_argument(
+            '--url', help='webhook url, including protocol')
+        self.parser.add_argument(
+            '--token', help='bearer token to provide on the webhook call')
+        self.parser.add_argument(
+            '--label', help='label to associate with this webhook')
+        self.parser.add_argument(
+            '--fingerprint', help='fingerprint of destination certificate')
+        self.parser.add_argument(
+            '--disabled', help='the initial disabled state of the webhook')
+        self.parser.add_argument(
+            'id', help='webhook id')
+        args = self.parser.parse_args(sys.argv[3:])
+
+        c = self.get_client()
+
+        try:
+            r = c.webhook_update(args.id, args.disabled, args.url,
+                                 args.token, args.fingerprint, args.label)
+            if r.get('id', '') != '':
+                print('webhook: %s' % r)
+            else:
+                print('webhook update failed: %s' % r)
+
+        except Exception as ex:
+            print('failed to contact service: %s' % ex)
+
+    def do_webhook_get(self):
+        self.parser = argparse.ArgumentParser(
+            description='Get a specific webhook, by ID.', usage='''orbapi webhook get id''')
+        self.parser.add_argument(
+            'id', help='webhook id')
+        args = self.parser.parse_args(sys.argv[3:])
+
+        c = self.get_client()
+
+        try:
+            r = c.webhook_get(args.id)
+            if r.get('id', '') != '':
+                print('webhook: %s' % r)
+            else:
+                print('webhook get failed: %s' % r)
+
+        except Exception as ex:
+            print('failed to contact orbital service: %s' % ex)
+            exit(1)
+
+    def do_webhook_list(self):
+        c = self.get_client()
+
+        try:
+            r = c.webhook_list()
+            print(r or [])
+
+        except Exception as ex:
+            print('failed to contact orbital service: %s' % ex)
+            exit(1)
+
+    def do_webhook_sendresult(self):
+        self.parser = argparse.ArgumentParser(
+            description='Send an existing result to an existing webhook.',
+            usage='orbapi webhook sendresult webhookID resultID')
+        self.parser.add_argument(
+            'webhookid', help='webhook id')
+        self.parser.add_argument(
+            'resultid', help='result id')
+        args = self.parser.parse_args(sys.argv[3:])
+
+        c = self.get_client()
+
+        try:
+            r = c.webhook_sendresult(args.webhookid, args.resultid)
+            if r.get('data', '') != '':
+                print('webhook: %s' % r)
+            else:
+                print('webhook send failed: %s' % r)
+
+        except Exception as ex:
+            print('failed to contact orbital service: %s' % ex)
+            exit(1)
+
+    def do_probe(self, subcommands):
+        self.parser = argparse.ArgumentParser(
+            description='Submit a probe')
+        self.parser.add_argument(
+            '--nodes',
+            help='Target the query to this list of nodes. Use "all" for all connected nodes.',
+            default=['all'],
+            nargs='*')
+        self.parser.add_argument(
+            '--os',
+            help='Target the query to this list of OSs. Leave blank to allow any OS.', nargs='*')
+        self.parser.add_argument(
+            '--stock',
+            help='Execute the named stock query. Arguments become stock query parameters (<name>=[value]).')
+        self.parser.add_argument(
+            '--names',
+            help='Adds a name to the osQuery. If specified, must specify one per query statement, using one flag',
+            nargs='*')
+        self.parser.add_argument(
+            '--labels',
+            help='Adds a label to the osQuery. If specified, must specify one per query statement, using one flag.',
+            nargs='*')
+        self.parser.add_argument(
+            '--expiry',
+            help='Time, in seconds, until the probe should expire', default='60')
+        self.parser.add_argument(
+            'sql',
+            help='SQL statement, or statements to run.', nargs='+')
+        args = self.parser.parse_args(sys.argv[2:])
+
+        c = self.get_client()
+
+        try:
+            expiry = int(args.expiry)
+            if expiry < 0:
+                raise(ValueError)
+        except Exception:
+            print('--expiry must be a number, >= 0')
+            exit(1)
+
+        expiry += int(time.time())
+
+        stockargs = {}
+        stock = ''
+        if args.stock:
+            p = args.stock.split()
+            if len(p) >= 2:
+                for item in p[1:]:
+                    a = item.split('=')
+                    if len(a) != 2:
+                        print(
+                            'expected key=value format for --stock args, found: %s' % item)
+                        exit(1)
+                    k, v = a[0].trim(), a[1].trim()
+                    stockargs[k] = v
+            stock = p[0]
+
+        names, labels = [], []
+        if args.names is not None:
+            names = args.names
+        if args.labels is not None:
+            labels = args.labels
+        if len(names) != 0 and len(args.sql) != len(names):
+            print(
+                '--names must be omitted, or one name must be provided for each of the %d queries' % len(args.sql))
+            exit(1)
+        if len(labels) != 0 and len(args.sql) != len(labels):
+            print(
+                '--labels must be omitted, or one label must be provided for each of the %d queries' % len(args.sql))
+            exit(1)
+
+        queries = []
+        for i, s in enumerate(args.sql):
+            item = {'sql': s}
+            if len(names) > 0:
+                item['name'] = names[i]
+            if len(labels) > 0:
+                item['label'] = labels[i]
+            item['sql'] = s
+            queries.append(item)
+
+        try:
+            r = c.probe(queries, expiry,
+                        args.nodes, args.os, stock, stockargs)
+
+            if r.get('results', '') != '':
+                print('probe successful: %s' % r)
+            else:
+                print('probe failed: %s' % r)
+
+        except Exception as ex:
+            print('failed to contact service: %s' % ex)
+
+    def do_query(self, subcommands):
+        self.parser = argparse.ArgumentParser(
+            description='Disable or Create a query', usage='''orbapi query <subcommand>\n\tcreate\n\tdisable''')
+        self.parser.add_argument(
+            'subcommand', help='query subcommand to run')
+        args = self.parser.parse_args(sys.argv[2:3])
+        subcommands.get(args.subcommand, self.do_usage)()
+
+    def do_query_disable(self):
+        self.parser = argparse.ArgumentParser(
+            description='Disable a query')
+        self.parser.add_argument(
+            'id', help='query id')
+        args = self.parser.parse_args(sys.argv[3:])
+
+        c = self.get_client()
+
+        try:
+            r = c.query_disable(args.id)
+            if r == 200:
+                print('status: success')
+            else:
+                print('query disable failed: %s' % r)
+
+        except Exception as ex:
+            print('failed to contact orbital service: %s' % ex)
+            exit(1)
+
+    def do_query_create(self):
+        self.parser = argparse.ArgumentParser(
+            description='Schedule a query')
+        self.parser.add_argument(
+            '--expiry',
+            help='Time, in seconds, until the query should expire', default='3600')
+        self.parser.add_argument(
+            '--interval',
+            help='Time, in seconds, between repeated same-node results. 0 for a single result.', default='0')
+        self.parser.add_argument(
+            '--name',
+            help='Populate the Query and Result Name field with this optional value.')
+        self.parser.add_argument(
+            '--nodes',
+            help='Target the query to this list of nodes. Use "all" for all connected nodes.',
+            default=['all'], nargs='*')
+        self.parser.add_argument(
+            '--os',
+            help='Target the query to this list of OSs. Leave blank to allow any OS.', nargs='*')
+        self.parser.add_argument(
+            '--postback',
+            help='Add a postback for each token, in the format: ' +
+            '<URL> [token [fingerprint [format [bucket region accesskey secretkey]]]].',
+            nargs='*')
+        self.parser.add_argument(
+            '--webhook',
+            help='Add a postback with this list of id of existing webhooks.', nargs='*')
+        self.parser.add_argument(
+            '--stock',
+            help='Execute the named stock query. Arguments become stock query parameters (<name>=[value]).')
+        self.parser.add_argument(
+            '--context',
+            help='Adds a comma separated list of key/value pairs to the query, and associated results.' +
+            ' key=value,key2=value2...')
+        self.parser.add_argument(
+            '--names',
+            help='Adds a name to the osQuery. If specified, must specify one per query statement, using one flag',
+            nargs='*')
+        self.parser.add_argument(
+            '--labels',
+            help='Adds a label to the osQuery. If specified, must specify one per query statement, using one flag.',
+            nargs='*')
+        self.parser.add_argument(
+            'sql',
+            help='SQL statement, or statements to run.', nargs='+')
+        args = self.parser.parse_args(sys.argv[3:])
+
+        c = self.get_client()
+
+        try:
+            interval = int(args.interval)
+            if interval < 0:
+                raise ValueError
+        except Exception:
+            print('--interval must be a number, >= 0')
+            exit(1)
+
+        try:
+            expiry = int(args.expiry)
+            if expiry < 0:
+                raise ValueError
+        except Exception:
+            print('--expiry must be a number, >= 0')
+            exit(1)
+
+        expiry += int(time.time())
+
+        postbacks = []
+        if args.postback:
+            for postback in args.postback:
+                pb = Postback()
+                if pb.parse(postback) is False:
+                    print(
+                        'each postback token must be in the form: ' +
+                        'URL [token [fingerprint [format [bucket region accesskey secretkey]]]]')
+                    exit(1)
+                postbacks.append(pb.__dict__)
+        if args.webhook:
+            for webhook in args.webhook:
+                pb = Postback(webhookid=webhook)
+                postbacks.append(pb.__dict__)
+
+        stockargs = {}
+        stock = ''
+        if args.stock:
+            p = args.stock.split()
+            if len(p) >= 2:
+                for item in p[1:]:
+                    a = item.split('=')
+                    if len(a) != 2:
+                        print(
+                            'expected key=value format for --stock args, found: %s' % item)
+                        exit(1)
+                    k, v = a[0].trim(), a[1].trim()
+                    stockargs[k] = v
+            stock = p[0]
+
+        context = {}
+        if args.context:
+            cs = re.split('[,|;| ]+', args.context)
+            for c in cs:
+                p = c.split('=')
+                if len(p) != 2:
+                    print('expected key=value format for --context, found: %s' % c)
+                    exit(1)
+                k, v = p[0].trim(), p[1].trim()
+                context[k] = v
+
+        names, labels = [], []
+        if args.names is not None:
+            names = args.names
+        if args.labels is not None:
+            labels = args.labels
+        if len(names) != 0 and len(args.sql) != len(names):
+            print(
+                '--names must be omitted, or one name must be provided for each of the %d queries' % len(args.sql))
+            exit(1)
+        if len(labels) != 0 and len(args.sql) != len(labels):
+            print(
+                '--labels must be omitted, or one label must be provided for each of the %d queries' % len(args.sql))
+            exit(1)
+
+        queries = []
+        for i, s in enumerate(args.sql):
+            item = {'sql': s}
+            if len(names) > 0:
+                item['name'] = names[i]
+            if len(labels) > 0:
+                item['label'] = labels[i]
+            item['sql'] = s
+            queries.append(item)
+
+        try:
+            r = c.query_create(queries, interval, expiry, args.nodes, args.os,
+                               postbacks, stock, stockargs, context)
+            if r.get('ID', '') != '':
+                print('query successful: %s' % r)
+            else:
+                print('query failed: %s' % r)
+
+        except Exception as ex:
+            print('failed to contact service: %s' % ex)
+
+    def do_results(self, dummy):
+        POLL_TIME = 10
+
+        self.parser = argparse.ArgumentParser(
+            description='Get results from a job')
+        self.parser.add_argument(
+            '--poll',
+            help='Time, in seconds, to poll for results, must be at least %s' % POLL_TIME, default=str(POLL_TIME))
+        self.parser.add_argument(
+            '--timeout',
+            help='Time, in seconds, to stop polling for results. 0 to check once. must be at least 0.', default='60')
+        self.parser.add_argument(
+            'jobid',
+            help='Job ID')
+
+        args = self.parser.parse_args(sys.argv[2:])
+
+        try:
+            poll = float(args.poll)
+        except Exception:
+            print('poll must be a number')
+            exit(1)
+
+        try:
+            timeout = float(args.timeout)
+        except Exception:
+            print('timeout must be a number')
+            exit(1)
+
+        if poll < POLL_TIME:
+            print('invalid poll value: %s, timeout(%s)\n' % (poll, timeout))
+            self.parser.print_help()
+            exit(1)
+
+        if timeout < 0:
+            print('invalid timeout value. must be at least 0')
+            self.parser.print_help()
+            exit(1)
+
+        c = self.get_client()
+
+        cursor = ''
+        stop = time.time() + poll
+        while time.time() < stop:
+            try:
+                r = c.results(args.jobid, cursor=cursor)
+                if r['error']['en'] != '':
+                    print('failed to get result: %s' % r)
+                    exit(1)
+
+                print('result: %s' % r)
+
+                cursor = r['next']
+                if cursor == '':
+                    break
+
+                print('\n')
+                time.sleep(timeout)
+
+            except Exception as ex:
+                print('failed to contact service: %s' % ex)
+
+    def do_features(self, subcommands):
+        self.parser = argparse.ArgumentParser(
+            description='Get, or list features', usage='''orbapi features <subcommand>\n\tget\n\tlist''')
+        self.parser.add_argument(
+            'subcommand', help='features subcommand to run')
+        args = self.parser.parse_args(sys.argv[2:3])
+        subcommands.get(args.subcommand, self.do_usage)()
+
+    def do_features_get(self):
+        self.parser = argparse.ArgumentParser(
+            description='Get a feature by id')
+        self.parser.add_argument(
+            'id', help='feature id')
+        args = self.parser.parse_args(sys.argv[3:])
+
+        c = self.get_client()
+
+        try:
+            r = c.features_get(args.id)
+            if r.get('id', '') != '':
+                print('feature: %s' % r)
+            else:
+                print('feature lookup failed: %s' % r)
+
+        except Exception as ex:
+            print('failed to contact service: %s' % ex)
+
+    def do_features_list(self):
+        self.parser = argparse.ArgumentParser(
+            description='List all features for the orgnization')
+
+        c = self.get_client()
+
+        try:
+            r = c.features_list()
+            print(r or [])
+
+        except Exception as ex:
+            print('failed to contact service: %s' % ex)
+
+
+if __name__ == '__main__':
+    LoadEnv()
+    OrbAPI()

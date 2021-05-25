@@ -1,0 +1,10 @@
+#!/bin/sh
+
+function must {
+  echo ".. $*"
+  $* && return 
+  echo "!! failed: $*"
+  exit 1
+}
+
+must flake8 --max-line-length 119 --config /dev/null orbital *.py orbital_api/*.py 
